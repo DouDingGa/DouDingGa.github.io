@@ -23,3 +23,10 @@ deploy:
   # repo: https://github.com/<user>/<repo>.git
   # branch: gh-pages
 
+
+archive_generator:
+  per_page: 10
+  yearly: true
+  monthly: true
+  daily: false
+

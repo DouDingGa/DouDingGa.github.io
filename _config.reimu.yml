@@ -124,6 +124,7 @@ sidebar:
     show_common: true # whether to show common sidebar, ignored on mobile devices
 
 social:
+  github: https://github.com/DouDingGa
   # email: mailto:xxx@gmail.com
   # github: https://github.com/yourname
   # google: https://plus.google.com/yourname
