@@ -1,0 +1,25 @@
+﻿title: Reimu Blog
+subtitle: ''
+description: 'A blog powered by Hexo & Reimu'
+keywords:
+author: DouDingGa
+language: zh-CN
+timezone: ''
+url: https://DouDingGa.github.io
+root: /
+permalink: :year/:month/:day/:title/
+permalink_defaults:
+pretty_urls:
+  trailing_index: true
+  trailing_html: true
+theme: reimu
+feed:
+  type: atom
+  path: atom.xml
+  limit: 20
+deploy:
+  type: ''   # 用 GitHub Actions 时留空；用 npm run deploy 时改成 git 并填 repo/branch
+  # type: git
+  # repo: https://github.com/<user>/<repo>.git
+  # branch: gh-pages
+
