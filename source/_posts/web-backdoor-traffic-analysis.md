@@ -4,6 +4,7 @@ date: 2026-11-15 03:30:00
 tags:
   - 流量分析
   - Wireshark
+  - 哥斯拉
 categories:
   - 蓝队
 ---
@@ -93,10 +94,184 @@ categories:
 
 ### 看攻击者做了什么
 
-有了后门地址，再按这个地址过滤，剩下的每一条请求，就是攻击者执行的每一条命令：
+有了后门地址，再按它过滤，剩下的请求就是攻击者的每一次操作：
 
 ![命令执行](/images/traffic/05-command.png)
 
-命令通常在请求参数里（比如 `cmd=whoami`），执行结果在响应体里。如果响应体是空的，说明是"盲执行"，那就只能靠参数推断，或者去服务器上找日志对照。
+但这里是**加密**的，直接看是一堆乱码。这个 webshell 是哥斯拉（Godzilla），密码 `gg`，请求体经过三层处理：
 
-到这里，攻击者的入口、后门位置、执行过的操作，就都还原出来了。
+```
+base64 → URL 解码 → XOR（密钥 3c6e0b8a9c15224a，第 i 个字节用 key[(i+1) % 16]）→ gzip
+```
+
+所以要先解密，才能看到它到底执行了什么。
+
+## 解密脚本
+
+把 pcap 里的 POST 请求提出来，按 TCP 流重组（要处理重传、分片），再逐层解开：
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+用法: python parse_cmds.py <pcap文件>     (依赖: pip install scapy)
+"""
+import sys, re, base64, gzip, zlib
+from urllib.parse import unquote
+from scapy.all import PcapReader, TCP, IP
+
+PASS = b'gg'
+KEY  = b'3c6e0b8a9c15224a'
+
+def xor_dec(data):
+    return bytes(b ^ KEY[(i + 1) & 15] for i, b in enumerate(data))
+
+def gunzip(data):
+    for fn in (gzip.decompress, lambda d: zlib.decompress(d, 16 + zlib.MAX_WBITS),
+               lambda d: zlib.decompress(d, -15)):
+        try:
+            return fn(data)
+        except Exception:
+            pass
+    return None
+
+def dechunk(body):
+    out, i = bytearray(), 0
+    while True:
+        j = body.find(b'\r\n', i)
+        if j < 0:
+            break
+        try:
+            sz = int(body[i:j].split(b';')[0], 16)
+        except ValueError:
+            return bytes(body)
+        if sz == 0:
+            break
+        out.extend(body[j + 2:j + 2 + sz])
+        i = j + 2 + sz + 2
+    return bytes(out)
+
+def reassemble(segments, syn_seq=None):
+    """按 TCP 序号重组去重。segments: {seq:(payload,frame)} -> (data, 帧号标记)"""
+    items = sorted(segments.items())
+    if syn_seq is not None:
+        items = sorted((((s - syn_seq - 1) & 0xffffffff), d) for s, d in items)
+    buf, marks = bytearray(), []
+    for off, d in items:
+        payload, frame = d
+        if off + len(payload) <= len(buf):
+            continue                          # 重传包，跳过
+        marks.append((len(buf), frame))
+        buf.extend(payload[len(buf) - off:] if off <= len(buf)
+                   else b'\x00' * (off - len(buf)) + payload)
+    return bytes(buf), marks
+
+def frame_at(marks, offset):
+    best = 0
+    for off, frame in marks:
+        if off <= offset:
+            best = frame
+        else:
+            break
+    return best
+
+def field(txt, name):
+    """提取参数字段值（格式: 字段名+类型字节+4字节长度+内容）"""
+    m = re.search(name.encode() + rb'.{1,5}', txt)
+    if not m:
+        return None
+    return txt[m.end():]
+
+def parse_cmd(txt):
+    """把解密后的请求体翻译成一句人话"""
+    if b'function run' in txt or txt.startswith(b'$parameters'):
+        return '上传核心 payload（%d 字节 PHP，写入 session）' % len(txt)
+    m = re.search(rb'methodName.{1,5}([A-Za-z_]{2,20})', txt)
+    name = m.group(1).decode() if m else ''
+    if b'fileValue' in txt:
+        f = re.search(rb'fileName.{1,5}(.*?)fileValue', txt, re.S)
+        fn = f.group(1).decode('utf-8', 'ignore').strip() if f else '?'
+        return '上传文件: %s（%d 字节）' % (fn, len(txt))
+    if name == 'execCommand':
+        c = field(txt, 'cmdLine')
+        cmd = c.decode('utf-8', 'ignore') if c else '?'
+        cmd = cmd.split('2>&1')[0].strip().strip('"')
+        m2 = re.search(r'cd /d "([^"]*)"\s*&\s*(.+)$', cmd)
+        if not m2:
+            m2 = re.search(r'cd /d (\S+)\s*&\s*(.+)$', cmd)
+        if m2:
+            return '执行命令: %s    （目录: %s）' % (m2.group(2).strip(), m2.group(1))
+        return '执行命令: ' + re.sub(r'^cmd /c ', '', cmd)
+    if name == 'getFiledirName':
+        p = re.search(rb'getFiledirName.{1,5}(E:.+?)(?:methodName|$)', txt, re.S)
+        return '列目录: ' + (p.group(1).decode('utf-8', 'ignore').strip() if p else '?')
+    simple = {'test': '连通测试', 'g_close': '关闭会话',
+              'getBasicsInfo': '收集系统信息'}
+    return simple.get(name, name or '未知操作')
+
+def main(path):
+    client, syns = {}, {}
+    with PcapReader(path) as reader:
+        for frame, p in enumerate(reader, 1):
+            if TCP not in p or IP not in p:
+                continue
+            if p[IP].src.endswith('.100') and p[TCP].dport == 8022:
+                k = p[TCP].sport
+                if p[TCP].flags & 0x02:
+                    syns[k] = p[TCP].seq
+                if len(p[TCP].payload):
+                    client.setdefault(k, {})[p[TCP].seq] = (bytes(p[TCP].payload), frame)
+
+    print('=' * 60)
+    print('指令解密（密码=%s 密钥=%s）' % (PASS.decode(), KEY.decode()))
+    print('=' * 60)
+    n = 0
+    for sport, segs in sorted(client.items()):
+        data, marks = reassemble(segs, syns.get(sport))
+        starts = [m.start() for m in re.finditer(rb'POST /\S+\.php[^\r\n ]*', data)]
+        for i, s in enumerate(starts):
+            seg = data[s:starts[i + 1] if i + 1 < len(starts) else len(data)]
+            h = seg.find(b'\r\n\r\n')
+            if h < 0:
+                continue
+            frame = frame_at(marks, s)
+            if b'multipart/form-data' in seg[:h]:
+                fn = re.search(rb'filename="([^"]+)"', seg)
+                print('[帧%d] 上传木马: %s' % (frame, fn.group(1).decode() if fn else '?'))
+                n += 1
+                continue
+            headers = seg[:h].decode('utf-8', 'replace')
+            body = seg[h + 4:]
+            if 'chunked' in headers.lower():
+                body = dechunk(body)
+            else:
+                mcl = re.search(r'Content-Length: (\d+)', headers, re.I)
+                if mcl:
+                    body = body[:int(mcl.group(1))]
+            body = body.strip()
+            if body.startswith(b'gg='):
+                body = body[3:].split(b'&')[0]
+            try:
+                raw = unquote(body.decode()).encode('latin1')
+                dec = xor_dec(base64.b64decode(re.sub(rb'\s+', b'', raw)))
+            except Exception:
+                continue
+            txt = gunzip(dec) or dec
+            print('[帧%d] %s' % (frame, parse_cmd(txt)))
+            n += 1
+    print('=' * 60)
+    print('共 %d 条指令' % n)
+
+if __name__ == '__main__':
+    main(sys.argv[1] if len(sys.argv) > 1 else r'C:\Users\29306\Desktop\流量分析.pcapng')
+```
+
+跑完会逐条列出攻击者做过的事：上传木马、执行命令、列目录、收集系统信息。
+
+到这里，入口、后门位置、执行过的操作就都还原出来了。
+
+最终 flag：
+
+```
+flag{hacker-gg}
+```
